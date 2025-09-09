@@ -1,19 +1,3 @@
-# Create a new v4 of the dashboard that:
-# - Reads both first and second sheet from Excel (if present)
-# - Forces sheet 2 rows to "Erhvervshus Midtjylland" as Vejleder
-# - Applies brand colors: #1f2951 (dark), #d6a550, #004899, with white text where relevant
-# - Styles Plotly charts with these colors
-# - Adds a simple branded header bar (no logo) using CSS
-# - Repackages into a zip with requirements and a README
-
-import os, zipfile, textwrap
-
-dash_path = "/mnt/data/dashboard.py"
-reqs_path = "/mnt/data/requirements.txt"
-readme_path = "/mnt/data/README.md"
-zip_path = "/mnt/data/vejlednings-dashboard_streamlit_v4.zip"
-
-code = r'''
 import os
 from datetime import datetime
 import pandas as pd
@@ -65,8 +49,7 @@ BUCKET_OTHER = "Erhvervshus Midtjylland"
 @st.cache_data(show_spinner=False)
 def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame:
     """
-    Læs både ark 1 og 2, hvis 2 findes. Tag samme kolonner som i ark 1.
-    Ark 2 (EHM) tildeles Vejleder = Erhvervshus Midtjylland.
+    Læs både ark 1 og 2, hvis 2 findes. Ark 2 (EHM) tildeles Vejleder = Erhvervshus Midtjylland.
     """
     if uploaded is not None:
         dfs = pd.read_excel(uploaded, sheet_name=None)
@@ -81,22 +64,20 @@ def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame
     sheet_names = list(dfs.keys())
     df1 = dfs[sheet_names[0]].copy()
     df1["__sheet__"] = sheet_names[0]
-
     merged = df1
 
     if len(sheet_names) >= 2:
         df2 = dfs[sheet_names[1]].copy()
         df2["__sheet__"] = sheet_names[1]
 
-        # Harmoniser kolonner (behold fælles)
         commons = [c for c in df2.columns if c in df1.columns]
         if commons:
             df2 = df2[commons + ["__sheet__"]]
-        # Tildel vejleder bucket
+
         df2["Vejleder"] = BUCKET_OTHER
         merged = pd.concat([merged, df2], ignore_index=True, sort=False)
 
-    # Hvis CREATOR_COL findes, map core navne for rækker uden "Vejleder" sat
+    # Map kerne-navne for rækker fra ark 1
     if CREATOR_COL in merged.columns:
         def clean_vejleder(val):
             if pd.isna(val):
@@ -105,9 +86,8 @@ def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame
             for name in CORE_NAMES:
                 if name.lower() in s:
                     return name
-            # Hvis ikke en af kerne-navnene → bucket
             return BUCKET_OTHER
-        # Sæt kun hvor Vejleder ikke allerede er udfyldt (fx fra ark 2 sat ovenfor)
+
         if "Vejleder" not in merged.columns:
             merged["Vejleder"] = merged[CREATOR_COL].apply(clean_vejleder)
         else:
@@ -160,10 +140,9 @@ if auto_refresh > 0:
 
 df = load_excel_merge_two_sheets(default_path, uploaded_file)
 if df.empty:
-    st.warning("Upload en Excel-fil eller angiv en sti i sidebaren. (V2 læser ark 1 + ark 2 og tildeler EHM korrekt)")
+    st.warning("Upload en Excel-fil eller angiv en sti i sidebaren. (Denne version læser ark 1 + ark 2 og bucket’er EHM)")
     st.stop()
 
-# Datoer
 date_col = pick_date_col(df)
 df = parse_dates(df, date_col)
 
@@ -217,14 +196,10 @@ def render_kpis(df: pd.DataFrame):
     with c2:
         if COMPANY_COL in df.columns:
             st.metric("🏷️ Unikke virksomheder", fmt_int(df[COMPANY_COL].nunique()))
-        else:
-            st.metric("🏷️ Unikke virksomheder", "—")
     with c3:
         if "Dato" in df.columns:
             sidste_30 = (df["Dato"] >= (pd.Timestamp.now() - pd.Timedelta(days=30))).sum()
             st.metric("🗓️ Seneste 30 dage", fmt_int(sidste_30))
-        else:
-            st.metric("🗓️ Seneste 30 dage", "—")
     with c4:
         if "Dato" in df.columns and not df.empty:
             row = df.sort_values("Dato", ascending=False).iloc[0]
@@ -232,8 +207,6 @@ def render_kpis(df: pd.DataFrame):
             if COMPANY_COL in df.columns and pd.notna(row.get(COMPANY_COL, None)):
                 txt += f" · {row[COMPANY_COL]}"
             st.metric("⏱️ Seneste vejledning", txt)
-        else:
-            st.metric("⏱️ Seneste vejledning", "—")
     with c5:
         ehm = (df["Vejleder"] == BUCKET_OTHER).sum()
         st.metric("🏢 EHM (filteret)", fmt_int(ehm))
@@ -250,8 +223,6 @@ def render_trend(df: pd.DataFrame):
         )
         fig = plot_line(trend, x="Måned", y="Antal", color="Vejleder")
         st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Ingen gyldig dato til at vise trend.")
 
 def render_distributions(df: pd.DataFrame):
     st.subheader("Fordelinger")
@@ -271,8 +242,6 @@ def render_distributions(df: pd.DataFrame):
             fig = plot_bar(by_topic, x=TOPIC_COL, y="Antal", text="Antal")
             fig.update_layout(xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Kolonnen 'Emner_Møder' findes ikke i data.")
     with col3:
         if KOMMUNE_COL in df.columns:
             st.markdown("**Kommunefordeling**")
@@ -283,8 +252,6 @@ def render_distributions(df: pd.DataFrame):
             fig = plot_bar(by_kom, x=KOMMUNE_COL, y="Antal", text="Antal")
             fig.update_layout(xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Kolonnen 'Kommune_Virksomheder' findes ikke i data.")
 
 def render_latest(df: pd.DataFrame):
     st.subheader("Seneste 10 vejledninger")
@@ -311,30 +278,4 @@ for sec in st.session_state.section_order:
     elif sec == "Seneste 10":
         render_latest(df)
 
-# Footer
 st.caption("Farvetema: #1f2951 · #d6a550 · #004899 · Data: ark 1 + ark 2 (EHM).")
-'''
-
-with open(dash_path, "w", encoding="utf-8") as f:
-    f.write(code)
-
-reqs = """streamlit
-pandas
-plotly
-openpyxl
-"""
-with open(reqs_path, "w", encoding="utf-8") as f:
-    f.write(reqs)
-
-readme = textwrap.dedent("""
-# Vejlednings-dashboard (v4, med EHM + brandfarver)
-
-**Nyt i denne version**
-- Læser både ark 1 og ark 2 fra Excel. Rækker fra ark 2 markeres automatisk som "Erhvervshus Midtjylland".
-- Brandfarver (#1f2951, #d6a550, #004899) på grafer og header.
-- Layout-rækkefølge kan styres i sidebaren.
-
-## Start (Windows/Mac/Linux)
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run dashboard.py

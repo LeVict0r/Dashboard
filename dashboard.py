@@ -46,10 +46,39 @@ BUCKET_OTHER = "Erhvervshus Midtjylland"
 # -----------------------------
 # HELPERS
 # -----------------------------
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    # Ensret kolonnenavne og fjern usynlige tegn
+    new_cols = []
+    seen = {}
+    for c in df.columns.map(lambda x: str(x).strip()):
+        base = c
+        if base in seen:
+            seen[base] += 1
+            c = f"{base}.{seen[base]}"
+        else:
+            seen[base] = 0
+        new_cols.append(c)
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+def _union_align(dfA: pd.DataFrame, dfB: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # Sikrer samme kolonner i begge, i samlet union-rækkefølge
+    cols_union = list(pd.Index(dfA.columns).union(dfB.columns))
+    for c in cols_union:
+        if c not in dfA.columns:
+            dfA[c] = pd.NA
+        if c not in dfB.columns:
+            dfB[c] = pd.NA
+    dfA = dfA[cols_union]
+    dfB = dfB[cols_union]
+    return dfA, dfB
+
 @st.cache_data(show_spinner=False)
 def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame:
     """
-    Læs både ark 1 og 2, hvis 2 findes. Ark 2 (EHM) tildeles Vejleder = Erhvervshus Midtjylland.
+    Læs både ark 1 og 2 (hvis 2 findes). Håndter dublette kolonnenavne, lav union af kolonner,
+    tildel ark 2 til 'Erhvervshus Midtjylland'.
     """
     if uploaded is not None:
         dfs = pd.read_excel(uploaded, sheet_name=None)
@@ -62,22 +91,29 @@ def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame
         return pd.DataFrame()
 
     sheet_names = list(dfs.keys())
-    df1 = dfs[sheet_names[0]].copy()
-    df1["__sheet__"] = sheet_names[0]
-    merged = df1
 
+    # Ark 1
+    df1 = _normalize_cols(dfs[sheet_names[0]].copy())
+    df1["__sheet__"] = sheet_names[0]
+
+    merged = df1.copy()
+
+    # Ark 2 (EHM)
     if len(sheet_names) >= 2:
-        df2 = dfs[sheet_names[1]].copy()
+        df2_raw = dfs[sheet_names[1]].copy()
+        df2 = _normalize_cols(df2_raw)
         df2["__sheet__"] = sheet_names[1]
 
-        commons = [c for c in df2.columns if c in df1.columns]
-        if commons:
-            df2 = df2[commons + ["__sheet__"]]
+        # Align kolonner mellem ark 1 og 2
+        df1_align, df2_align = _union_align(merged, df2)
 
-        df2["Vejleder"] = BUCKET_OTHER
-        merged = pd.concat([merged, df2], ignore_index=True, sort=False)
+        # Sæt vejleder for ark 2 til EHM (overskriv hvis kolonnen findes)
+        df2_align["Vejleder"] = BUCKET_OTHER
 
-    # Map kerne-navne for rækker fra ark 1
+        # Concat efter align → ingen InvalidIndexError
+        merged = pd.concat([df1_align, df2_align], ignore_index=True, sort=False)
+
+    # Map kerne-navne for rækker (hvor Vejleder ikke allerede sat)
     if CREATOR_COL in merged.columns:
         def clean_vejleder(val):
             if pd.isna(val):
@@ -93,6 +129,10 @@ def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame
         else:
             mask_empty = merged["Vejleder"].isna() | (merged["Vejleder"] == "")
             merged.loc[mask_empty, "Vejleder"] = merged.loc[mask_empty, CREATOR_COL].apply(clean_vejleder)
+    else:
+        if "Vejleder" not in merged.columns:
+            merged["Vejleder"] = BUCKET_OTHER
+        merged["Vejleder"] = merged["Vejleder"].fillna(BUCKET_OTHER)
 
     return merged
 

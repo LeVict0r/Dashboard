@@ -1,32 +1,120 @@
+# Create a new v4 of the dashboard that:
+# - Reads both first and second sheet from Excel (if present)
+# - Forces sheet 2 rows to "Erhvervshus Midtjylland" as Vejleder
+# - Applies brand colors: #1f2951 (dark), #d6a550, #004899, with white text where relevant
+# - Styles Plotly charts with these colors
+# - Adds a simple branded header bar (no logo) using CSS
+# - Repackages into a zip with requirements and a README
 
+import os, zipfile, textwrap
+
+dash_path = "/mnt/data/dashboard.py"
+reqs_path = "/mnt/data/requirements.txt"
+readme_path = "/mnt/data/README.md"
+zip_path = "/mnt/data/vejlednings-dashboard_streamlit_v4.zip"
+
+code = r'''
 import os
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
+# -----------------------------
+# BRAND
+# -----------------------------
+COLOR_DARK   = "#1f2951"  # mørk primær
+COLOR_ACCENT = "#d6a550"  # detalje
+COLOR_BLUE   = "#004899"  # detalje
+COLOR_WHITE  = "#ffffff"
+
+PLOTLY_COLORWAY = [COLOR_ACCENT, COLOR_BLUE, COLOR_DARK, "#888888", "#bbbbbb"]
+
+# -----------------------------
+# STREAMLIT CONFIG
+# -----------------------------
 st.set_page_config(page_title="Vejlednings-dashboard", page_icon="📊", layout="wide")
 
-DATE_COL_CANDIDATES = ["Mødedato", "Mødedato_Møder"]
+# Branded header (uden logo)
+st.markdown(
+    f"""
+    <div style="background:{COLOR_DARK}; padding:14px 18px; border-radius:12px; margin-bottom:14px;">
+        <h1 style="color:{COLOR_WHITE}; margin:0; font-weight:700; font-size:22px;">📊 Vejlednings-dashboard</h1>
+        <p style="color:{COLOR_WHITE}; opacity:.85; margin:4px 0 0 0; font-size:13px;">ErhvervsForum Holstebro · live overblik</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# -----------------------------
+# CONSTANTS
+# -----------------------------
+DATE_COL_CANDIDATES = ["Mødedato", "Mødedato_Møder", "Dato"]
 CREATOR_COL = "Oprettet_af_Møder"
 COMPANY_COL = "Firmanavn_Virksomheder"
-TOPIC_COL = "Emner_Møder"
-TITLE_COL = "Titel_Møder"
+TOPIC_COL   = "Emner_Møder"
+TITLE_COL   = "Titel_Møder"
 KOMMUNE_COL = "Kommune_Virksomheder"
 
 CORE_NAMES = ["Victor", "Jan", "Mette", "Kristina", "Sara", "Peter"]
 BUCKET_OTHER = "Erhvervshus Midtjylland"
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 @st.cache_data(show_spinner=False)
-def load_excel(path: str = None, uploaded=None) -> pd.DataFrame:
+def load_excel_merge_two_sheets(path: str = None, uploaded=None) -> pd.DataFrame:
+    """
+    Læs både ark 1 og 2, hvis 2 findes. Tag samme kolonner som i ark 1.
+    Ark 2 (EHM) tildeles Vejleder = Erhvervshus Midtjylland.
+    """
     if uploaded is not None:
-        df = pd.read_excel(uploaded)
+        dfs = pd.read_excel(uploaded, sheet_name=None)
     elif path and os.path.exists(path):
-        df = pd.read_excel(path)
+        dfs = pd.read_excel(path, sheet_name=None)
     else:
         return pd.DataFrame()
-    df.columns = [str(c) for c in df.columns]
-    return df
+
+    if not isinstance(dfs, dict) or len(dfs) == 0:
+        return pd.DataFrame()
+
+    sheet_names = list(dfs.keys())
+    df1 = dfs[sheet_names[0]].copy()
+    df1["__sheet__"] = sheet_names[0]
+
+    merged = df1
+
+    if len(sheet_names) >= 2:
+        df2 = dfs[sheet_names[1]].copy()
+        df2["__sheet__"] = sheet_names[1]
+
+        # Harmoniser kolonner (behold fælles)
+        commons = [c for c in df2.columns if c in df1.columns]
+        if commons:
+            df2 = df2[commons + ["__sheet__"]]
+        # Tildel vejleder bucket
+        df2["Vejleder"] = BUCKET_OTHER
+        merged = pd.concat([merged, df2], ignore_index=True, sort=False)
+
+    # Hvis CREATOR_COL findes, map core navne for rækker uden "Vejleder" sat
+    if CREATOR_COL in merged.columns:
+        def clean_vejleder(val):
+            if pd.isna(val):
+                return BUCKET_OTHER
+            s = str(val).lower()
+            for name in CORE_NAMES:
+                if name.lower() in s:
+                    return name
+            # Hvis ikke en af kerne-navnene → bucket
+            return BUCKET_OTHER
+        # Sæt kun hvor Vejleder ikke allerede er udfyldt (fx fra ark 2 sat ovenfor)
+        if "Vejleder" not in merged.columns:
+            merged["Vejleder"] = merged[CREATOR_COL].apply(clean_vejleder)
+        else:
+            mask_empty = merged["Vejleder"].isna() | (merged["Vejleder"] == "")
+            merged.loc[mask_empty, "Vejleder"] = merged.loc[mask_empty, CREATOR_COL].apply(clean_vejleder)
+
+    return merged
 
 def pick_date_col(df: pd.DataFrame) -> str | None:
     for c in DATE_COL_CANDIDATES:
@@ -37,127 +125,166 @@ def pick_date_col(df: pd.DataFrame) -> str | None:
 def parse_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
     if date_col:
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col])
+        df["Dato"] = df[date_col]
+        df["Måned"] = df["Dato"].apply(lambda d: pd.Timestamp(year=d.year, month=d.month, day=1) if pd.notnull(d) else pd.NaT)
     return df
 
-def clean_vejleder(val: str | None) -> str:
-    if not isinstance(val, str) or val.strip() == "":
-        return BUCKET_OTHER
-    lower = val.lower()
-    for name in CORE_NAMES:
-        if name.lower() in lower:
-            return name
-    if "erhvervshus" in lower and "midt" in lower:
-        return BUCKET_OTHER
-    return BUCKET_OTHER
-
-def month_floor(dt: pd.Timestamp) -> pd.Timestamp:
-    return pd.Timestamp(year=dt.year, month=dt.month, day=1)
-
-def kpi_metric(label: str, value, help_text: str | None = None):
-    st.metric(label, value, help=help_text)
-
-def format_int(n):
+def fmt_int(n):
     try:
         return f"{int(n):,}".replace(",", ".")
     except Exception:
         return "—"
 
+def plot_line(df, x, y, color=None):
+    fig = px.line(df, x=x, y=y, color=color, markers=True, color_discrete_sequence=PLOTLY_COLORWAY)
+    fig.update_layout(margin=dict(l=0, r=0, t=6, b=6), height=380, plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+def plot_bar(df, x, y, color=None, text=None):
+    fig = px.bar(df, x=x, y=y, color=color, text=text, color_discrete_sequence=PLOTLY_COLORWAY)
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_layout(margin=dict(l=0, r=0, t=6, b=6), height=320, plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+# -----------------------------
+# SIDEBAR: DATA
+# -----------------------------
 st.sidebar.header("🔧 Datakilde")
 default_path = st.sidebar.text_input("Sti til Excel-fil", value=os.environ.get("DASHBOARD_DATA_PATH", ""))
 uploaded_file = st.sidebar.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
+auto_refresh = st.sidebar.number_input("Auto-refresh (sek.)", min_value=0, max_value=3600, value=0, step=5)
+if auto_refresh > 0:
+    st.sidebar.caption("Browseren kan også auto-reloade via skærmsoftware.")
+    st.experimental_set_query_params(_=datetime.now().isoformat())
 
-df = load_excel(default_path, uploaded_file)
+df = load_excel_merge_two_sheets(default_path, uploaded_file)
 if df.empty:
-    st.warning("Upload en Excel-fil eller angiv en sti i sidebaren.")
+    st.warning("Upload en Excel-fil eller angiv en sti i sidebaren. (V2 læser ark 1 + ark 2 og tildeler EHM korrekt)")
     st.stop()
 
+# Datoer
 date_col = pick_date_col(df)
 df = parse_dates(df, date_col)
-if date_col:
-    df = df.dropna(subset=[date_col])
 
-if CREATOR_COL in df.columns:
-    df["Vejleder"] = df[CREATOR_COL].apply(clean_vejleder)
-else:
+# -----------------------------
+# FILTRE
+# -----------------------------
+st.sidebar.header("🔎 Filtre")
+if "Vejleder" not in df.columns:
     df["Vejleder"] = BUCKET_OTHER
 
-if date_col:
-    df["Dato"] = df[date_col]
-    df["Måned"] = df["Dato"].apply(lambda d: month_floor(d) if pd.notnull(d) else pd.NaT)
-
-st.sidebar.header("🔎 Filtre")
-unique_vejledere = sorted(df["Vejleder"].dropna().unique())
+unique_vejledere = sorted(df["Vejleder"].dropna().unique(), key=lambda x: (x != BUCKET_OTHER, x))
 selected_vejledere = st.sidebar.multiselect("Vejleder(e)", options=list(unique_vejledere), default=unique_vejledere)
 
 if selected_vejledere:
     df = df[df["Vejleder"].isin(selected_vejledere)]
 
+if "Dato" in df.columns and not df["Dato"].isna().all():
+    min_dato = pd.to_datetime(df["Dato"].min()).date()
+    max_dato = pd.to_datetime(df["Dato"].max()).date()
+    date_range = st.sidebar.date_input("Datointerval", value=(min_dato, max_dato))
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+        mask = (df["Dato"].dt.date >= start_date) & (df["Dato"].dt.date <= end_date)
+        df = df[mask]
+
+# -----------------------------
+# LAYOUT-KONTROL
+# -----------------------------
 st.sidebar.header("🧩 Layout")
 SECTIONS = ["KPIs", "Udvikling", "Fordelinger", "Seneste 10"]
 if "section_order" not in st.session_state:
     st.session_state.section_order = SECTIONS.copy()
 
-opt1 = st.sidebar.selectbox("1. sektion", SECTIONS, index=0)
-remaining2 = [s for s in SECTIONS if s != opt1]
-opt2 = st.sidebar.selectbox("2. sektion", remaining2, index=0)
-remaining3 = [s for s in remaining2 if s != opt2]
-opt3 = st.sidebar.selectbox("3. sektion", remaining3, index=0)
-remaining4 = [s for s in remaining3 if s != opt3]
-opt4 = st.sidebar.selectbox("4. sektion", remaining4, index=0)
+opt1 = st.sidebar.selectbox("1. sektion", SECTIONS, index=0, key="s1")
+rem2 = [s for s in SECTIONS if s != opt1]
+opt2 = st.sidebar.selectbox("2. sektion", rem2, index=0, key="s2")
+rem3 = [s for s in rem2 if s != opt2]
+opt3 = st.sidebar.selectbox("3. sektion", rem3, index=0, key="s3")
+rem4 = [s for s in rem3 if s != opt3]
+opt4 = st.sidebar.selectbox("4. sektion", rem4, index=0, key="s4")
 st.session_state.section_order = [opt1, opt2, opt3, opt4]
 
+# -----------------------------
+# SECTIONS
+# -----------------------------
 def render_kpis(df: pd.DataFrame):
     st.subheader("Nøgletal")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        kpi_metric("📈 Total vejledninger", format_int(len(df)))
+        st.metric("📈 Total (filteret)", fmt_int(len(df)))
     with c2:
         if COMPANY_COL in df.columns:
-            kpi_metric("🏷️ Unikke virksomheder", format_int(df[COMPANY_COL].nunique()))
+            st.metric("🏷️ Unikke virksomheder", fmt_int(df[COMPANY_COL].nunique()))
+        else:
+            st.metric("🏷️ Unikke virksomheder", "—")
     with c3:
         if "Dato" in df.columns:
             sidste_30 = (df["Dato"] >= (pd.Timestamp.now() - pd.Timedelta(days=30))).sum()
-            kpi_metric("🗓️ Seneste 30 dage", format_int(sidste_30))
+            st.metric("🗓️ Seneste 30 dage", fmt_int(sidste_30))
+        else:
+            st.metric("🗓️ Seneste 30 dage", "—")
     with c4:
         if "Dato" in df.columns and not df.empty:
-            seneste_row = df.sort_values("Dato", ascending=False).iloc[0]
-            seneste_txt = seneste_row["Dato"].strftime("%Y-%m-%d")
-            if COMPANY_COL in df.columns and pd.notna(seneste_row.get(COMPANY_COL, None)):
-                seneste_txt += f" · {seneste_row[COMPANY_COL]}"
-            kpi_metric("⏱️ Seneste vejledning", seneste_txt)
+            row = df.sort_values("Dato", ascending=False).iloc[0]
+            txt = row["Dato"].strftime("%Y-%m-%d")
+            if COMPANY_COL in df.columns and pd.notna(row.get(COMPANY_COL, None)):
+                txt += f" · {row[COMPANY_COL]}"
+            st.metric("⏱️ Seneste vejledning", txt)
+        else:
+            st.metric("⏱️ Seneste vejledning", "—")
     with c5:
-        total_eh = (df["Vejleder"] == BUCKET_OTHER).sum()
-        kpi_metric("🏢 Erhvervshus Midtjylland", format_int(total_eh))
+        ehm = (df["Vejleder"] == BUCKET_OTHER).sum()
+        st.metric("🏢 EHM (filteret)", fmt_int(ehm))
 
 def render_trend(df: pd.DataFrame):
     st.subheader("Udvikling over tid")
     if "Måned" in df.columns and not df["Måned"].isna().all():
         trend = (
             df.dropna(subset=["Måned"])
-              .groupby(["Måned", "Vejleder"])
+              .groupby(["Måned", "Vejleder"], dropna=False)
               .size()
               .reset_index(name="Antal")
+              .sort_values("Måned")
         )
-        fig = px.line(trend, x="Måned", y="Antal", color="Vejleder", markers=True)
+        fig = plot_line(trend, x="Måned", y="Antal", color="Vejleder")
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Ingen gyldig dato til at vise trend.")
 
 def render_distributions(df: pd.DataFrame):
     st.subheader("Fordelinger")
     col1, col2, col3 = st.columns(3)
     with col1:
-        by_vej = df.groupby("Vejleder").size().reset_index(name="Antal").sort_values("Antal", ascending=False)
-        fig = px.bar(by_vej, x="Vejleder", y="Antal", text="Antal")
+        st.markdown("**Vejledninger pr. vejleder**")
+        by_vej = df.groupby("Vejleder", dropna=False).size().reset_index(name="Antal").sort_values("Antal", ascending=False)
+        fig = plot_bar(by_vej, x="Vejleder", y="Antal", text="Antal")
         st.plotly_chart(fig, use_container_width=True)
     with col2:
         if TOPIC_COL in df.columns:
-            by_topic = df.groupby(TOPIC_COL).size().reset_index(name="Antal").sort_values("Antal", ascending=False).head(10)
-            fig = px.bar(by_topic, x=TOPIC_COL, y="Antal", text="Antal")
+            st.markdown("**Top emner/temaer**")
+            by_topic = (df.assign(**{TOPIC_COL: df[TOPIC_COL].fillna("Ukendt")})
+                          .groupby(TOPIC_COL, dropna=False).size()
+                          .reset_index(name="Antal")
+                          .sort_values("Antal", ascending=False).head(12))
+            fig = plot_bar(by_topic, x=TOPIC_COL, y="Antal", text="Antal")
+            fig.update_layout(xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Kolonnen 'Emner_Møder' findes ikke i data.")
     with col3:
         if KOMMUNE_COL in df.columns:
-            by_kom = df.groupby(KOMMUNE_COL).size().reset_index(name="Antal").sort_values("Antal", ascending=False).head(10)
-            fig = px.bar(by_kom, x=KOMMUNE_COL, y="Antal", text="Antal")
+            st.markdown("**Kommunefordeling**")
+            by_kom = (df.assign(**{KOMMUNE_COL: df[KOMMUNE_COL].fillna("Ukendt")})
+                        .groupby(KOMMUNE_COL, dropna=False).size()
+                        .reset_index(name="Antal")
+                        .sort_values("Antal", ascending=False).head(12))
+            fig = plot_bar(by_kom, x=KOMMUNE_COL, y="Antal", text="Antal")
+            fig.update_layout(xaxis_tickangle=-30)
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Kolonnen 'Kommune_Virksomheder' findes ikke i data.")
 
 def render_latest(df: pd.DataFrame):
     st.subheader("Seneste 10 vejledninger")
@@ -168,10 +295,12 @@ def render_latest(df: pd.DataFrame):
     tbl = df.sort_values("Dato", ascending=False)[cols].head(10)
     if "Dato" in tbl.columns:
         tbl["Dato"] = tbl["Dato"].dt.strftime("%Y-%m-%d")
+    tbl = tbl.rename(columns={COMPANY_COL:"Virksomhed", TOPIC_COL:"Emne", TITLE_COL:"Titel"})
     st.dataframe(tbl, use_container_width=True)
 
-st.title("📊 Vejlednings-dashboard")
-
+# -----------------------------
+# RENDER ORDER
+# -----------------------------
 for sec in st.session_state.section_order:
     if sec == "KPIs":
         render_kpis(df)
@@ -182,4 +311,30 @@ for sec in st.session_state.section_order:
     elif sec == "Seneste 10":
         render_latest(df)
 
-st.caption("Layout kan tilpasses i sidebaren. KPI viser også total for Erhvervshus Midtjylland.")
+# Footer
+st.caption("Farvetema: #1f2951 · #d6a550 · #004899 · Data: ark 1 + ark 2 (EHM).")
+'''
+
+with open(dash_path, "w", encoding="utf-8") as f:
+    f.write(code)
+
+reqs = """streamlit
+pandas
+plotly
+openpyxl
+"""
+with open(reqs_path, "w", encoding="utf-8") as f:
+    f.write(reqs)
+
+readme = textwrap.dedent("""
+# Vejlednings-dashboard (v4, med EHM + brandfarver)
+
+**Nyt i denne version**
+- Læser både ark 1 og ark 2 fra Excel. Rækker fra ark 2 markeres automatisk som "Erhvervshus Midtjylland".
+- Brandfarver (#1f2951, #d6a550, #004899) på grafer og header.
+- Layout-rækkefølge kan styres i sidebaren.
+
+## Start (Windows/Mac/Linux)
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run dashboard.py
